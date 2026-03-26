@@ -18,7 +18,7 @@ import webbrowser
 import winsound
 import winreg
 from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Callable
 
@@ -34,12 +34,12 @@ except ImportError:
 # ============================================================================
 
 APP_NAME = "Hesap Arkadasi"
-STATE_DIR = Path.home() / ".accountability_buddy"
+APP_VERSION = "0.1.0"
+STATE_DIR = Path(__file__).resolve().parent / "data"
 STATE_FILE = STATE_DIR / "state.json"
 
 CHECKIN_INTERVAL_MIN = 30
 REMINDER_DELAY_MIN = 5
-SESSION_RESET_HOURS = 8
 
 COLORS = {
     "bg": "#1a1a2e", "bg_light": "#16213e", "bg_card": "#0f3460",
@@ -169,9 +169,14 @@ class Task:
 @dataclass
 class CheckIn:
     timestamp: str
-    response: str
-    ai_feedback: str
     score: int
+    task_id: Optional[int] = None       # hangi gorevde calisildi
+    task_title: str = ""                 # gorev adi (referans icin)
+    progress: str = ""                   # bu gorevde ne yapildi
+    blocker: str = ""                    # engel varsa
+    next_step: str = ""                  # siradaki adim
+    mood: str = ""                       # iyi/orta/kotu
+    summary: str = ""                    # genel ozet (1 cumle)
 
 
 # ============================================================================
@@ -187,7 +192,8 @@ class StateManager:
         self.reminder_delay: int = REMINDER_DELAY_MIN
         self.startup_enabled: bool = False
         self.used_messages: list[str] = []
-        self.model: str = "sonnet"  # claude model: sonnet, opus, haiku
+        self.model: str = "sonnet"
+        self.session_id: str = str(__import__("uuid").uuid4())
         STATE_DIR.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> None:
@@ -201,35 +207,30 @@ class StateManager:
                 STATE_FILE.rename(backup)
             return
 
-        last_session = data.get("session_start", "")
-        if last_session:
-            try:
-                last_dt = datetime.fromisoformat(last_session)
-                if (datetime.now() - last_dt) > timedelta(hours=SESSION_RESET_HOURS):
-                    for t in data.get("tasks", []):
-                        t["status"] = "bekliyor"
-                        t["started_at"] = None
-                        t["completed_at"] = None
-                    data["checkins"] = []
-                    data["session_start"] = datetime.now().isoformat()
-            except ValueError:
-                pass
-
         self.session_start = data.get("session_start", self.session_start)
         self.checkin_interval = data.get("checkin_interval", CHECKIN_INTERVAL_MIN)
         self.reminder_delay = data.get("reminder_delay", REMINDER_DELAY_MIN)
         self.startup_enabled = data.get("startup_enabled", False)
         self.used_messages = data.get("used_messages", [])
         self.model = data.get("model", "sonnet")
+        if data.get("session_id"):
+            self.session_id = data["session_id"]
 
         self.tasks = [
             Task(**{k: v for k, v in t.items() if k in Task.__dataclass_fields__})
             for t in data.get("tasks", [])
         ]
-        self.checkins = [
-            CheckIn(**{k: v for k, v in c.items() if k in CheckIn.__dataclass_fields__})
-            for c in data.get("checkins", [])
-        ]
+        self.checkins = []
+        for c in data.get("checkins", []):
+            # Migrate old formats
+            if "response" in c and "summary" not in c:
+                c["summary"] = c.pop("response", "")
+            if "ai_feedback" in c and "progress" not in c:
+                c["progress"] = c.pop("ai_feedback", "")
+            c.pop("ai_feedback", None)
+            c.pop("response", None)
+            filtered = {k: v for k, v in c.items() if k in CheckIn.__dataclass_fields__}
+            self.checkins.append(CheckIn(**filtered))
 
     def save(self) -> None:
         data = {
@@ -240,6 +241,7 @@ class StateManager:
             "startup_enabled": self.startup_enabled,
             "used_messages": self.used_messages[-100:],
             "model": self.model,
+            "session_id": self.session_id,
             "tasks": [asdict(t) for t in self.tasks],
             "checkins": [asdict(c) for c in self.checkins],
         }
@@ -293,53 +295,114 @@ class StateManager:
 # ============================================================================
 
 class AIManager:
+    """Thin wrapper around Claude CLI. All smarts are in Claude, we just call it."""
+
+    # Path to Claude CLI session storage
+    SESSIONS_DIR = Path.home() / ".claude" / "projects"
+
+    SESSION_NAME = "accountability-buddy"
+
     def __init__(self, state: StateManager) -> None:
         self.state = state
         self.claude_path = (
             shutil.which("claude")
             or str(Path.home() / ".local" / "bin" / "claude.exe")
         )
+        # Fixed session ID so we always resume the same conversation
+        self.session_id = state.session_id
 
-    def analyze_response(self, user_text: str, root: tk.Tk,
-                         callback: Callable[[str, int], None]) -> None:
-        def worker() -> None:
-            try:
-                feedback, score = self._call_claude(user_text)
-            except Exception:
-                feedback, score = self._get_fallback(user_text)
-            root.after(0, callback, feedback, score)
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _call_claude(self, user_text: str) -> tuple[str, int]:
+    def _build_system_prompt(self) -> str:
         tasks_str = "\n".join(
             f"  {t.id}. [{t.status}] {t.title} ({t.estimated_minutes}dk)"
             for t in self.state.tasks
         ) or "  (gorev yok)"
 
-        prompt = SYSTEM_PROMPT.format(
+        # Include recent check-in history for context
+        history_str = ""
+        recent = self.state.checkins[-5:]
+        if recent:
+            history_lines = []
+            for ci in recent:
+                line = f"  [{ci.score}/10]"
+                if ci.task_title:
+                    line += f" Gorev: {ci.task_title} -"
+                if ci.progress:
+                    line += f" {ci.progress}"
+                if ci.blocker:
+                    line += f" | Engel: {ci.blocker}"
+                if ci.next_step:
+                    line += f" | Sonraki: {ci.next_step}"
+                if ci.mood:
+                    line += f" ({ci.mood})"
+                history_lines.append(line)
+            history_str = "\n\nSon check-in gecmisi:\n" + "\n".join(history_lines)
+
+        return SYSTEM_PROMPT.format(
             tasks=tasks_str,
             elapsed=self.state.get_elapsed_str(),
             completed=self.state.get_completed_count(),
             total=len(self.state.tasks),
+        ) + history_str
+
+    def _run_claude(self, prompt: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+        # Check if session exists (resume) or needs to be created
+        session_file = self._get_session_file()
+        if session_file and session_file.exists():
+            cmd = [
+                self.claude_path, "-p", prompt,
+                "--resume", self.session_id,
+                "--model", self.state.model,
+                "--output-format", "json",
+            ]
+        else:
+            cmd = [
+                self.claude_path, "-p", prompt,
+                "--session-id", self.session_id,
+                "--system-prompt", self._build_system_prompt(),
+                "--model", self.state.model,
+                "--output-format", "json",
+                "--name", self.SESSION_NAME,
+            ]
+        return subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=timeout, encoding="utf-8",
         )
-        full_prompt = f"{prompt}\n\nKullanicinin cevabi: \"{user_text}\""
 
-        # Map model names
-        model_flag = {"sonnet": "sonnet", "opus": "opus", "haiku": "haiku"}.get(
-            self.state.model, "sonnet"
-        )
+    def _get_session_file(self) -> Optional[Path]:
+        """Find the JSONL file for our session in Claude's project dirs."""
+        try:
+            for d in self.SESSIONS_DIR.iterdir():
+                candidate = d / f"{self.session_id}.jsonl"
+                if candidate.exists():
+                    return candidate
+        except (OSError, StopIteration):
+            pass
+        return None
 
-        result = subprocess.run(
-            [self.claude_path, "-p", full_prompt, "--model", model_flag],
-            capture_output=True, text=True, timeout=30,
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr[:200])
-
-        return self._parse_response(result.stdout.strip())
+    def send_message(self, user_text: str, root: tk.Tk,
+                     callback: Callable[[str, int], None]) -> None:
+        """Send message to Claude CLI, parse response, callback on main thread."""
+        def worker() -> None:
+            try:
+                result = self._run_claude(user_text)
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr[:200])
+                feedback, score = self._parse_response(result.stdout.strip())
+            except Exception:
+                feedback, score = self._get_fallback(user_text)
+            root.after(0, callback, feedback, score)
+        threading.Thread(target=worker, daemon=True).start()
 
     def _parse_response(self, raw: str) -> tuple[str, int]:
+        # --output-format json wraps in {"type":"result","result":"..."}
+        try:
+            outer = json.loads(raw)
+            if isinstance(outer, dict) and "result" in outer:
+                raw = outer["result"]
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Try to extract our JSON scoring format
         match = re.search(r'\{[^}]+\}', raw)
         if match:
             try:
@@ -349,8 +412,7 @@ class AIManager:
                 return feedback, score
             except (json.JSONDecodeError, ValueError):
                 pass
-        # If JSON parse fails, use the raw text as feedback
-        return raw[:200], 5
+        return raw[:300], 5
 
     def _get_fallback(self, user_text: str) -> tuple[str, int]:
         text_lower = user_text.lower().strip()
@@ -377,12 +439,44 @@ class AIManager:
         self.state.used_messages.append(msg)
         return msg, score
 
+    def get_chat_history(self) -> list[dict[str, str]]:
+        """Read chat messages from Claude CLI's session storage."""
+        messages: list[dict[str, str]] = []
+        # Find session jsonl file
+        session_file = None
+        for d in self.SESSIONS_DIR.iterdir():
+            candidate = d / f"{self.session_id}.jsonl"
+            if candidate.exists():
+                session_file = candidate
+                break
+        if not session_file:
+            return messages
+        try:
+            for line in session_file.read_text(encoding="utf-8").splitlines():
+                msg = json.loads(line)
+                msg_type = msg.get("type", "")
+                if msg_type == "user":
+                    content = msg.get("message", {}).get("content", "")
+                    if isinstance(content, str) and content:
+                        messages.append({"role": "user", "text": content})
+                elif msg_type == "assistant":
+                    content = msg.get("message", {}).get("content", "")
+                    if isinstance(content, dict) and content.get("type") == "text":
+                        messages.append({"role": "ai", "text": content["text"]})
+                    elif isinstance(content, list):
+                        for c in content:
+                            if isinstance(c, dict) and c.get("type") == "text":
+                                messages.append({"role": "ai", "text": c["text"]})
+        except Exception:
+            pass
+        return messages
+
     def test_connection(self, callback: Callable[[bool, str], None], root: tk.Tk) -> None:
         def worker() -> None:
             try:
                 result = subprocess.run(
                     [self.claude_path, "-p", "Sadece 'Merhaba!' yaz.", "--model", "haiku"],
-                    capture_output=True, text=True, timeout=15,
+                    capture_output=True, text=True, timeout=15, encoding="utf-8",
                 )
                 if result.returncode == 0:
                     root.after(0, callback, True, result.stdout.strip()[:80])
@@ -399,8 +493,9 @@ class AIManager:
 
 class CheckInPopup:
     def __init__(self, root: tk.Tk, state: StateManager, ai: AIManager,
-                 on_done: Callable[[str, str, int], None],
-                 on_skip: Callable[[], None]) -> None:
+                 on_done: Callable[..., None],
+                 on_skip: Callable[[], None],
+                 is_continuation: bool = False) -> None:
         self.root = root
         self.state = state
         self.ai = ai
@@ -411,6 +506,8 @@ class CheckInPopup:
         self.first_response: Optional[str] = None
         self.last_feedback: str = ""
         self.last_score: int = 5
+        self.is_continuation = is_continuation
+        self.message_count: int = 0
 
     def show(self) -> None:
         if self.window and self.window.winfo_exists():
@@ -431,7 +528,7 @@ class CheckInPopup:
         sx = self.window.winfo_screenwidth()
         sy = self.window.winfo_screenheight()
         self.window.geometry(f"{w}x{h}+{(sx-w)//2}+{(sy-h)//2}")
-        self.window.protocol("WM_DELETE_WINDOW", self._on_skip)
+        self.window.protocol("WM_DELETE_WINDOW", self._on_close)
 
         frame = tk.Frame(self.window, bg=COLORS["bg"], padx=20, pady=10)
         frame.pack(fill="both", expand=True)
@@ -469,6 +566,13 @@ class CheckInPopup:
         self.chat_canvas.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         self.chat_canvas.pack(side="left", fill="both", expand=True)
+
+        # Load previous chat messages from Claude CLI session
+        prev_messages = self.ai.get_chat_history()
+        if prev_messages:
+            for msg in prev_messages[-10:]:  # Last 10 messages
+                self._add_bubble(msg["text"], is_ai=(msg["role"] == "ai"))
+            self._add_bubble("--- yeni check-in ---", is_ai=True)
 
         question = TR["checkin_question"].format(interval=self.state.checkin_interval)
         self._add_bubble(question, is_ai=True)
@@ -533,7 +637,7 @@ class CheckInPopup:
         self.text_input.delete("1.0", "end")
         self.submit_btn.configure(state="disabled")
         self._add_bubble(TR["ai_thinking"], is_ai=True)
-        self.ai.analyze_response(text, self.root, self._on_ai_response)
+        self.ai.send_message(text, self.root, self._on_ai_response)
 
     def _on_ai_response(self, feedback: str, score: int) -> None:
         self.last_feedback = feedback
@@ -549,9 +653,66 @@ class CheckInPopup:
     def _on_close(self) -> None:
         if self.timeout_id:
             self.root.after_cancel(self.timeout_id)
-        response = self.first_response or "(bos cevap)"
+        if self.first_response is None:
+            self.destroy()
+            return
+        # Ask Claude for a task-focused summary before closing
+        self.submit_btn.configure(state="disabled")
+        self.done_btn.configure(state="disabled")
+        self._add_bubble("Ozet hazirlaniyor...", is_ai=True)
+
+        active = self.state.get_active_task()
+        task_context = ""
+        if active:
+            task_context = f"Aktif gorev: #{active.id} '{active.title}' ({active.estimated_minutes}dk). "
+
+        self.ai.send_message(
+            f'{task_context}Bu check-in sohbetini gorev bazli ozetle. '
+            'Sadece JSON ver, baska bir sey yazma: '
+            '{"task_id": gorev_numarasi_veya_null, '
+            '"progress": "bu gorevde ne yapildi (kisa)", '
+            '"blocker": "engel varsa yazin yoksa bos", '
+            '"next_step": "siradaki adim", '
+            '"mood": "iyi/orta/kotu", '
+            '"score": 0-10, '
+            '"summary": "1 cumle genel ozet"}',
+            self.root, self._on_summary
+        )
+
+    def _on_summary(self, raw_feedback: str, raw_score: int) -> None:
+        task_id = None
+        task_title = ""
+        progress = ""
+        blocker = ""
+        next_step = ""
+        mood = ""
+        summary = raw_feedback
+        score = raw_score
+
+        try:
+            # Handle nested JSON from --output-format json
+            match = re.search(r'\{[^}]+\}', raw_feedback)
+            if match:
+                data = json.loads(match.group())
+                task_id = data.get("task_id")
+                progress = data.get("progress", "")
+                blocker = data.get("blocker", "")
+                next_step = data.get("next_step", "")
+                mood = data.get("mood", "")
+                score = max(0, min(10, int(data.get("score", raw_score))))
+                summary = data.get("summary", raw_feedback)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Resolve task title
+        if task_id:
+            for t in self.state.tasks:
+                if t.id == task_id:
+                    task_title = t.title
+                    break
+
         self.destroy()
-        self.on_done(response, self.last_feedback, self.last_score)
+        self.on_done(task_id, task_title, progress, blocker, next_step, mood, summary, score)
 
     def _on_skip(self) -> None:
         if self.timeout_id:
@@ -695,10 +856,15 @@ class Dashboard:
         self.elapsed_var = tk.StringVar(value="0sa 0dk")
         self._stat_row(stats, TR["elapsed_label"], self.elapsed_var, COLORS["text_dim"])
 
+        tk.Button(parent, text="💬 Claude ile Konus", font=("Segoe UI", 10, "bold"),
+                  bg=COLORS["accent"], fg=COLORS["white"],
+                  activebackground=COLORS["accent_light"], relief="flat", pady=5,
+                  command=self._open_chat).pack(fill="x", pady=(10, 0))
+
         tk.Button(parent, text="⚙ " + TR["settings_title"], font=("Segoe UI", 10),
                   bg=COLORS["bg_card"], fg=COLORS["text_dim"],
                   activebackground=COLORS["bg_light"], relief="flat", pady=5,
-                  command=self._show_settings).pack(fill="x", pady=(10, 0))
+                  command=self._show_settings).pack(fill="x", pady=(5, 0))
 
     def _stat_row(self, parent: tk.Frame, label: str, var: tk.StringVar, color: str) -> None:
         row = tk.Frame(parent, bg=COLORS["bg_card"])
@@ -787,7 +953,15 @@ class Dashboard:
                      bg=COLORS["bg_light"]).pack(side="left")
             tk.Label(row, text=f"[{ci.score}/10]", font=("Segoe UI", 9, "bold"),
                      fg=sc_color, bg=COLORS["bg_light"]).pack(side="left", padx=5)
-            short = ci.response[:40] + ("..." if len(ci.response) > 40 else "")
+            # Show task + progress or summary
+            display = ""
+            if ci.task_title:
+                display = f"{ci.task_title}: {ci.progress}" if ci.progress else ci.task_title
+            elif ci.summary:
+                display = ci.summary
+            else:
+                display = ci.progress or "(ozet yok)"
+            short = display[:50] + ("..." if len(display) > 50 else "")
             tk.Label(row, text=short, font=("Segoe UI", 9), fg=COLORS["text"],
                      bg=COLORS["bg_light"]).pack(side="left", padx=5)
 
@@ -826,6 +1000,10 @@ class Dashboard:
         self.state.tasks = [t for t in self.state.tasks if t.id != task.id]
         self.state.save()
         self.refresh()
+
+    def _open_chat(self) -> None:
+        """Open chat with Claude using --continue (continues last conversation)."""
+        self.engine._trigger_chat()
 
     def _show_settings(self) -> None:
         SettingsDialog(self.root, self.state, self.engine)
@@ -1003,7 +1181,7 @@ class SetupWizard:
         claude_exe = shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude.exe")
         try:
             _check = subprocess.run(
-                [claude_exe, "--version"], capture_output=True, text=True, timeout=5)
+                [claude_exe, "--version"], capture_output=True, text=True, timeout=5, encoding="utf-8")
             cli_found = _check.returncode == 0
             cli_version = _check.stdout.strip()
         except Exception:
@@ -1181,32 +1359,50 @@ class Engine:
                                   self._on_checkin_done, self._on_checkin_skip)
         self.popup.show()
 
-    def _on_checkin_done(self, user_text: str, feedback: str, score: int) -> None:
-        checkin = CheckIn(timestamp=datetime.now().isoformat(),
-                          response=user_text, ai_feedback=feedback, score=score)
+    def _trigger_chat(self) -> None:
+        """Open chat popup with --continue (continues last Claude conversation)."""
+        if self.popup and self.popup.window and self.popup.window.winfo_exists():
+            self.popup.window.lift()
+            self.popup.window.focus_force()
+            return
+        self.popup = CheckInPopup(self.root, self.state, self.ai,
+                                  self._on_checkin_done, self._on_checkin_skip,
+                                  is_continuation=True)
+        self.popup.show()
+
+    def _on_checkin_done(self, task_id: Optional[int], task_title: str,
+                         progress: str, blocker: str, next_step: str,
+                         mood: str, summary: str, score: int) -> None:
+        checkin = CheckIn(
+            timestamp=datetime.now().isoformat(),
+            score=score, task_id=task_id, task_title=task_title,
+            progress=progress, blocker=blocker, next_step=next_step,
+            mood=mood, summary=summary,
+        )
         self.state.checkins.append(checkin)
         self.state.save()
-        self.dashboard.show_feedback(feedback, score)
+        self.dashboard.show_feedback(summary, score)
         self.dashboard.refresh()
         self._schedule_checkin()
 
-        if score >= 8:
-            active = self.state.get_active_task()
-            if active:
-                done_kw = ["bitirdim", "tamamladim", "hallettim", "bitti"]
-                if any(k in user_text.lower() for k in done_kw):
-                    active.status = "bitti"
-                    active.completed_at = datetime.now().isoformat()
-                    self.state.save()
-                    self.dashboard.refresh()
+        # Auto-complete task if high score and progress indicates done
+        if score >= 8 and task_id:
+            for t in self.state.tasks:
+                if t.id == task_id and t.status == "devam":
+                    done_kw = ["tamamlandi", "bitti", "bitirdi", "halletti"]
+                    if any(k in progress.lower() for k in done_kw):
+                        t.status = "bitti"
+                        t.completed_at = datetime.now().isoformat()
+                        self.state.save()
+                        self.dashboard.refresh()
+                    break
 
         if score <= 2:
-            SternWarning(self.root, feedback)
+            SternWarning(self.root, summary)
 
     def _on_checkin_skip(self) -> None:
         self.state.checkins.append(CheckIn(
-            timestamp=datetime.now().isoformat(), response="(atlanmis)",
-            ai_feedback=TR["checkin_ignored"], score=0))
+            timestamp=datetime.now().isoformat(), summary="(atlanmis)", score=0))
         self.state.save()
         self.dashboard.refresh()
         if self.checkin_after_id:
